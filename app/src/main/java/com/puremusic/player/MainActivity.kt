@@ -3,14 +3,19 @@ package com.puremusic.player
 import android.Manifest
 import android.content.ComponentName
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
 import android.os.Bundle
+import android.util.Size
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.*
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -28,8 +33,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
@@ -37,13 +44,24 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
-import androidx.media3.common.Player
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.google.common.util.concurrent.ListenableFuture
 import com.google.common.util.concurrent.MoreExecutors
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
-import java.io.File
+import kotlinx.coroutines.withContext
+
+// 大厂色调系统（Tonal Hierarchy）
+private val BgSurface = Color(0xFF0C0D10)           // 基底黑曜石（含2%冷调灰）
+private val BgContainer = Color(0xFF16181D)         // 悬浮容器层
+private val BgKey = Color(0xFF1E2128)               // 抬升功能层
+private val LineHairline = Color(0xFF262A33)        // 发丝级几何线 (0.8dp)
+private val TextPrimary = Color(0xFFF3F4F6)         // 象牙白（主视觉）
+private val TextSecondary = Color(0xFF888E9B)       // 工业冷灰（副文本）
+private val TextTertiary = Color(0xFF525763)        // 暗色时间刻度
+private val AccentActive = Color(0xFFECEFF1)        // 冷白钛光标
+private val AccentHeart = Color(0xFFE06C75)         // 哑光琥珀红（收藏）
 
 class MainActivity : ComponentActivity() {
 
@@ -60,16 +78,12 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
-                    background = Color(0xFF121212),
-                    surface = Color(0xFF1E1E1E),
-                    primary = Color(0xFFBB86FC),
-                    secondary = Color(0xFF03DAC6)
+                    background = BgSurface,
+                    surface = BgContainer,
+                    primary = TextPrimary
                 )
             ) {
-                MainScreen(
-                    getController = { mediaController },
-                    onControllerReady = { ctrl -> mediaController = ctrl }
-                )
+                MainScreen(getController = { mediaController })
             }
         }
 
@@ -86,10 +100,7 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen(
-    getController: () -> MediaController?,
-    onControllerReady: (MediaController) -> Unit
-) {
+fun MainScreen(getController: () -> MediaController?) {
     val context = LocalContext.current
     val repository = remember { MusicRepository(context) }
     var allSongs by remember { mutableStateOf(emptyList<Song>()) }
@@ -99,12 +110,13 @@ fun MainScreen(
     var duration by remember { mutableLongStateOf(1L) }
     var isShuffle by remember { mutableStateOf(false) }
 
-    // 意图搜索与抽屉
     var searchQuery by remember { mutableStateOf("") }
     var showDrawer by remember { mutableStateOf(false) }
     var selectedTag by remember { mutableStateOf("全部") }
 
-    // 权限检查
+    // 封面位图状态
+    var currentCoverBitmap by remember { mutableStateOf<Bitmap?>(null) }
+
     var hasPermission by remember {
         mutableStateOf(
             ContextCompat.checkSelfPermission(
@@ -137,7 +149,7 @@ fun MainScreen(
         }
     }
 
-    // 定时轮询播放进度
+    // 定时轮询播放器状态
     LaunchedEffect(Unit) {
         while (true) {
             getController()?.let { ctrl ->
@@ -148,7 +160,7 @@ fun MainScreen(
                 currentSongId = idStr?.toLongOrNull()
                 isShuffle = ctrl.shuffleModeEnabled
             }
-            delay(500)
+            delay(400)
         }
     }
 
@@ -156,7 +168,22 @@ fun MainScreen(
         allSongs.find { it.id == currentSongId } ?: allSongs.firstOrNull()
     }
 
-    // 播放指定歌曲
+    // 异步加载原生专辑封面
+    LaunchedEffect(currentSong?.id) {
+        currentSong?.let { song ->
+            withContext(Dispatchers.IO) {
+                try {
+                    val bmp = context.contentResolver.loadThumbnail(song.contentUri, Size(512, 512), null)
+                    currentCoverBitmap = bmp
+                } catch (_: Exception) {
+                    currentCoverBitmap = null
+                }
+            }
+        } ?: run {
+            currentCoverBitmap = null
+        }
+    }
+
     fun playSong(song: Song) {
         val ctrl = getController() ?: return
         val index = allSongs.indexOfFirst { it.id == song.id }
@@ -179,7 +206,6 @@ fun MainScreen(
         BackupManager.saveBackup(context, allSongs)
     }
 
-    // 快捷切歌
     fun playNext() {
         val ctrl = getController() ?: return
         if (ctrl.hasNextMediaItem()) ctrl.seekToNextMediaItem()
@@ -192,7 +218,6 @@ fun MainScreen(
         else if (allSongs.isNotEmpty()) playSong(allSongs.last())
     }
 
-    // 自动聚类标签：提取所有文件夹作为意图标签
     val folders = remember(allSongs) {
         allSongs.map { it.folder }.distinct().filter { it.isNotBlank() }
     }
@@ -214,7 +239,7 @@ fun MainScreen(
 
     Scaffold(
         modifier = Modifier.fillMaxSize(),
-        containerColor = Color(0xFF121212)
+        containerColor = BgSurface
     ) { padding ->
         Box(
             modifier = Modifier
@@ -228,14 +253,36 @@ fun MainScreen(
                 verticalArrangement = Arrangement.SpaceBetween
             ) {
 
-                // [上半屏]：纯粹的听歌视觉 + 全局单手手势
+                // [顶部状态标识：工业极简标尺]
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 28.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "OFFLINE · DIRECT PCM",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 1.5.sp,
+                        color = TextTertiary
+                    )
+                    Text(
+                        text = if (isShuffle) "SHUFFLE" else "SEQUENTIAL",
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium,
+                        letterSpacing = 1.2.sp,
+                        color = if (isShuffle) TextPrimary else TextTertiary
+                    )
+                }
+
+                // [上中区：画廊级专辑海报与呼吸留白]
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f)
-                        .padding(24.dp)
-                        .clip(RoundedCornerShape(32.dp))
-                        .background(Color(0xFF1A1A1A))
+                        .padding(horizontal = 36.dp, vertical = 8.dp)
                         .pointerInput(Unit) {
                             detectTapGestures(
                                 onDoubleTap = {
@@ -244,7 +291,7 @@ fun MainScreen(
                                         BackupManager.saveBackup(context, allSongs)
                                         Toast.makeText(
                                             context,
-                                            if (it.isFavorite) "已收藏 ❤️" else "已取消收藏",
+                                            if (it.isFavorite) "已标记偏爱" else "已取消标记",
                                             Toast.LENGTH_SHORT
                                         ).show()
                                     }
@@ -266,69 +313,83 @@ fun MainScreen(
                         },
                     contentAlignment = Alignment.Center
                 ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
+                    // 正方形画廊卡片 (高阶倒角 20dp + 发丝线边框)
+                    Box(
+                        modifier = Modifier
+                            .aspectRatio(1f)
+                            .fillMaxSize(0.85f)
+                            .clip(RoundedCornerShape(20.dp))
+                            .background(BgContainer)
+                            .border(1.dp, LineHairline, RoundedCornerShape(20.dp)),
+                        contentAlignment = Alignment.Center
                     ) {
-                        // 经典大黑胶质感纯色圆盘（不耗 GPU，极省电）
-                        Box(
-                            modifier = Modifier
-                                .size(200.dp)
-                                .clip(CircleShape)
-                                .background(Color(0xFF262626)),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(60.dp)
-                                    .clip(CircleShape)
-                                    .background(if (currentSong?.isFavorite == true) Color(0xFFE91E63) else Color(0xFF333333)),
-                                contentAlignment = Alignment.Center
+                        val bmp = currentCoverBitmap
+                        if (bmp != null) {
+                            Image(
+                                bitmap = bmp.asImageBitmap(),
+                                contentDescription = null,
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        } else {
+                            // 瑞士风格极简排版图案
+                            Column(
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
                             ) {
-                                Icon(
-                                    imageVector = if (currentSong?.isFavorite == true) Icons.Default.Favorite else Icons.Default.MusicNote,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(32.dp)
+                                Text(
+                                    text = (currentSong?.title?.take(1) ?: "P").uppercase(),
+                                    fontSize = 64.sp,
+                                    fontWeight = FontWeight.Light,
+                                    color = TextSecondary.copy(alpha = 0.4f),
+                                    fontFamily = FontFamily.SansSerif
+                                )
+                                Spacer(modifier = Modifier.height(8.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .width(32.dp)
+                                        .height(1.dp)
+                                        .background(LineHairline)
                                 )
                             }
                         }
-
-                        Spacer(modifier = Modifier.height(24.dp))
-                        Text(
-                            text = if (allSongs.isEmpty()) "本地暂无歌曲" else "左右滑切歌 · 双击收藏",
-                            color = Color.Gray,
-                            fontSize = 12.sp
-                        )
                     }
                 }
 
-                // [下半屏]：大拇指黄金触达区（无 Tab，开屏即播，一键搜歌）
+                // [下半屏：大厂级排版与单手触达区]
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 24.dp, vertical = 12.dp)
+                        .padding(horizontal = 28.dp, vertical = 12.dp)
                 ) {
-                    // 曲目信息
-                    Text(
-                        text = currentSong?.title ?: "纯音播放器",
-                        style = MaterialTheme.typography.titleLarge.copy(
-                            fontWeight = FontWeight.Bold,
-                            color = Color.White
-                        ),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                    Text(
-                        text = "${currentSong?.artist ?: "本地音频"} · ${currentSong?.folder ?: "默认"}",
-                        style = MaterialTheme.typography.bodyMedium.copy(color = Color.LightGray),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    // 1. 曲目信息（主次对比极致分明）
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text(
+                            text = currentSong?.title ?: "纯音",
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = TextPrimary,
+                            letterSpacing = (-0.4).sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "${currentSong?.artist ?: "本地音轨"} · ${currentSong?.folder ?: "默认合辑"}",
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Normal,
+                            color = TextSecondary,
+                            letterSpacing = 0.2.sp,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
 
-                    Spacer(modifier = Modifier.height(12.dp))
+                    Spacer(modifier = Modifier.height(28.dp))
 
-                    // 进度条（下沉至拇指自然滑动区）
+                    // 2. 发丝级光纤进度条 (2dp 极细轨道)
                     Slider(
                         value = currentPosition.toFloat(),
                         onValueChange = { newPos ->
@@ -337,29 +398,44 @@ fun MainScreen(
                         },
                         valueRange = 0f..duration.toFloat(),
                         colors = SliderDefaults.colors(
-                            thumbColor = Color(0xFFBB86FC),
-                            activeTrackColor = Color(0xFFBB86FC),
-                            inactiveTrackColor = Color(0xFF333333)
+                            thumbColor = AccentActive,
+                            activeTrackColor = AccentActive,
+                            inactiveTrackColor = LineHairline
                         ),
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(20.dp)
                     )
 
                     Row(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 4.dp),
                         horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Text(formatTime(currentPosition), color = Color.Gray, fontSize = 12.sp)
-                        Text(formatTime(duration), color = Color.Gray, fontSize = 12.sp)
+                        Text(
+                            formatTime(currentPosition),
+                            color = TextTertiary,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
+                        Text(
+                            formatTime(duration),
+                            color = TextTertiary,
+                            fontSize = 11.sp,
+                            fontFamily = FontFamily.Monospace
+                        )
                     }
 
-                    Spacer(modifier = Modifier.height(8.dp))
+                    Spacer(modifier = Modifier.height(20.dp))
 
-                    // 主播放控制器
+                    // 3. 几何对称线框控制器 (Dieter Rams 几何秩序)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
+                        // 随机播放
                         IconButton(onClick = {
                             val ctrl = getController() ?: return@IconButton
                             ctrl.shuffleModeEnabled = !ctrl.shuffleModeEnabled
@@ -368,51 +444,57 @@ fun MainScreen(
                             Icon(
                                 imageVector = Icons.Default.Shuffle,
                                 contentDescription = "随机",
-                                tint = if (isShuffle) Color(0xFFBB86FC) else Color.Gray
+                                tint = if (isShuffle) TextPrimary else TextTertiary,
+                                modifier = Modifier.size(20.dp)
                             )
                         }
 
-                        IconButton(onClick = { playPrev() }, modifier = Modifier.size(48.dp)) {
+                        // 上一首
+                        IconButton(onClick = { playPrev() }, modifier = Modifier.size(44.dp)) {
                             Icon(
                                 imageVector = Icons.Default.SkipPrevious,
                                 contentDescription = "上一首",
-                                tint = Color.White,
-                                modifier = Modifier.size(36.dp)
+                                tint = TextPrimary,
+                                modifier = Modifier.size(28.dp)
                             )
                         }
 
-                        // 大播放/暂停圆钮
-                        FilledIconButton(
-                            onClick = {
-                                val ctrl = getController() ?: return@FilledIconButton
-                                if (ctrl.mediaItemCount == 0 && allSongs.isNotEmpty()) {
-                                    playSong(allSongs.first())
-                                } else {
-                                    if (ctrl.isPlaying) ctrl.pause() else ctrl.play()
-                                }
-                            },
-                            modifier = Modifier.size(68.dp),
-                            colors = IconButtonDefaults.filledIconButtonColors(
-                                containerColor = Color(0xFFBB86FC)
-                            )
+                        // 核心播放按钮（微抬升哑光圆盘）
+                        Box(
+                            modifier = Modifier
+                                .size(64.dp)
+                                .clip(CircleShape)
+                                .background(BgKey)
+                                .border(1.dp, LineHairline, CircleShape)
+                                .clickable {
+                                    val ctrl = getController() ?: return@clickable
+                                    if (ctrl.mediaItemCount == 0 && allSongs.isNotEmpty()) {
+                                        playSong(allSongs.first())
+                                    } else {
+                                        if (ctrl.isPlaying) ctrl.pause() else ctrl.play()
+                                    }
+                                },
+                            contentAlignment = Alignment.Center
                         ) {
                             Icon(
                                 imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                                 contentDescription = "播放暂停",
-                                tint = Color.Black,
-                                modifier = Modifier.size(36.dp)
+                                tint = TextPrimary,
+                                modifier = Modifier.size(30.dp)
                             )
                         }
 
-                        IconButton(onClick = { playNext() }, modifier = Modifier.size(48.dp)) {
+                        // 下一首
+                        IconButton(onClick = { playNext() }, modifier = Modifier.size(44.dp)) {
                             Icon(
                                 imageVector = Icons.Default.SkipNext,
                                 contentDescription = "下一首",
-                                tint = Color.White,
-                                modifier = Modifier.size(36.dp)
+                                tint = TextPrimary,
+                                modifier = Modifier.size(28.dp)
                             )
                         }
 
+                        // 收藏心标
                         IconButton(onClick = {
                             currentSong?.let {
                                 it.isFavorite = !it.isFavorite
@@ -422,114 +504,144 @@ fun MainScreen(
                             Icon(
                                 imageVector = if (currentSong?.isFavorite == true) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
                                 contentDescription = "收藏",
-                                tint = if (currentSong?.isFavorite == true) Color(0xFFE91E63) else Color.Gray
+                                tint = if (currentSong?.isFavorite == true) AccentHeart else TextTertiary,
+                                modifier = Modifier.size(20.dp)
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(16.dp))
+                    Spacer(modifier = Modifier.height(28.dp))
 
-                    // 替代传统 Tab 的“意图搜歌胶囊”
+                    // 4. 底部悬浮药丸（Safari / Arc 风格的纯粹意图入口）
                     Surface(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(52.dp)
-                            .clip(RoundedCornerShape(26.dp))
+                            .height(46.dp)
+                            .clip(RoundedCornerShape(23.dp))
+                            .border(1.dp, LineHairline, RoundedCornerShape(23.dp))
                             .clickable { showDrawer = true },
-                        color = Color(0xFF242424)
+                        color = BgContainer
                     ) {
                         Row(
                             modifier = Modifier
                                 .fillMaxSize()
-                                .padding(horizontal = 20.dp),
-                            verticalAlignment = Alignment.CenterVertically
+                                .padding(horizontal = 18.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.SpaceBetween
                         ) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                Icon(
+                                    imageVector = Icons.Default.Search,
+                                    contentDescription = null,
+                                    tint = TextTertiary,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Text(
+                                    text = "按意图找歌 (${allSongs.size} 首已收录)",
+                                    color = TextSecondary,
+                                    fontSize = 13.sp,
+                                    letterSpacing = 0.2.sp
+                                )
+                            }
                             Icon(
-                                imageVector = Icons.Default.Search,
+                                imageVector = Icons.Default.KeyboardArrowUp,
                                 contentDescription = null,
-                                tint = Color.LightGray
-                            )
-                            Spacer(modifier = Modifier.width(12.dp))
-                            Text(
-                                text = "按意图找歌 (共 ${allSongs.size} 首本地音乐)...",
-                                color = Color.Gray,
-                                fontSize = 14.sp
+                                tint = TextTertiary,
+                                modifier = Modifier.size(18.dp)
                             )
                         }
                     }
                 }
             }
 
-            // [单手意图抽屉]：只用搜索和自动分组，不要任何标签页
+            // [意图抽屉：大厂级排版流]
             if (showDrawer) {
                 ModalBottomSheet(
                     onDismissRequest = { showDrawer = false },
-                    containerColor = Color(0xFF1E1E1E),
-                    dragHandle = { BottomSheetDefaults.DragHandle(color = Color.Gray) }
+                    containerColor = Color(0xFF111317),
+                    dragHandle = {
+                        Box(
+                            modifier = Modifier
+                                .padding(vertical = 12.dp)
+                                .width(36.dp)
+                                .height(4.dp)
+                                .clip(RoundedCornerShape(2.dp))
+                                .background(LineHairline)
+                        )
+                    }
                 ) {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp)
+                            .padding(horizontal = 20.dp)
                     ) {
-                        // 搜索输入框
+                        // 极简圆角搜索框
                         OutlinedTextField(
                             value = searchQuery,
                             onValueChange = { searchQuery = it },
-                            placeholder = { Text("搜索歌曲、歌手或意图关键词...", color = Color.Gray) },
+                            placeholder = { Text("搜索歌曲、歌手或文件夹意图...", color = TextTertiary, fontSize = 14.sp) },
                             singleLine = true,
                             shape = RoundedCornerShape(24.dp),
                             colors = OutlinedTextFieldDefaults.colors(
-                                focusedTextColor = Color.White,
-                                unfocusedTextColor = Color.White,
-                                focusedBorderColor = Color(0xFFBB86FC),
-                                unfocusedBorderColor = Color(0xFF333333),
-                                focusedContainerColor = Color(0xFF262626),
-                                unfocusedContainerColor = Color(0xFF262626)
+                                focusedTextColor = TextPrimary,
+                                unfocusedTextColor = TextPrimary,
+                                focusedBorderColor = TextPrimary,
+                                unfocusedBorderColor = LineHairline,
+                                focusedContainerColor = BgContainer,
+                                unfocusedContainerColor = BgContainer
                             ),
                             leadingIcon = {
-                                Icon(Icons.Default.Search, contentDescription = null, tint = Color.Gray)
+                                Icon(Icons.Default.Search, contentDescription = null, tint = TextTertiary, modifier = Modifier.size(18.dp))
                             },
                             trailingIcon = {
                                 if (searchQuery.isNotEmpty()) {
                                     IconButton(onClick = { searchQuery = "" }) {
-                                        Icon(Icons.Default.Clear, contentDescription = null, tint = Color.Gray)
+                                        Icon(Icons.Default.Clear, contentDescription = null, tint = TextTertiary, modifier = Modifier.size(16.dp))
                                     }
                                 }
                             },
                             modifier = Modifier.fillMaxWidth()
                         )
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
-                        // 自动聚类标签流（文件夹即歌单，整理零费力）
+                        // 自动聚类胶囊流
                         LazyRow(
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
                             modifier = Modifier.fillMaxWidth()
                         ) {
                             items(autoTags) { tag ->
                                 val isSelected = selectedTag == tag
-                                FilterChip(
-                                    selected = isSelected,
-                                    onClick = { selectedTag = tag },
-                                    label = { Text(tag) },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = Color(0xFFBB86FC),
-                                        selectedLabelColor = Color.Black,
-                                        containerColor = Color(0xFF262626),
-                                        labelColor = Color.LightGray
+                                Surface(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(16.dp))
+                                        .clickable { selectedTag = tag }
+                                        .border(
+                                            1.dp,
+                                            if (isSelected) TextPrimary else LineHairline,
+                                            RoundedCornerShape(16.dp)
+                                        ),
+                                    color = if (isSelected) TextPrimary else BgContainer
+                                ) {
+                                    Text(
+                                        text = tag,
+                                        color = if (isSelected) BgSurface else TextSecondary,
+                                        fontSize = 12.sp,
+                                        fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal,
+                                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
                                     )
-                                )
+                                }
                             }
                         }
 
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(14.dp))
 
-                        // 歌曲列表：一触即播
+                        // 歌曲列表
                         LazyColumn(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .heightIn(max = 400.dp)
+                                .heightIn(max = 420.dp)
                         ) {
                             items(filteredSongs) { song ->
                                 val isCurrent = song.id == currentSongId
@@ -541,28 +653,29 @@ fun MainScreen(
                                             playSong(song)
                                             showDrawer = false
                                         }
-                                        .padding(vertical = 10.dp, horizontal = 12.dp),
+                                        .padding(vertical = 12.dp, horizontal = 12.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
                                     Icon(
                                         imageVector = if (isCurrent) Icons.Default.Equalizer else Icons.Default.MusicNote,
                                         contentDescription = null,
-                                        tint = if (isCurrent) Color(0xFFBB86FC) else Color.Gray,
-                                        modifier = Modifier.size(20.dp)
+                                        tint = if (isCurrent) TextPrimary else TextTertiary,
+                                        modifier = Modifier.size(18.dp)
                                     )
-                                    Spacer(modifier = Modifier.width(12.dp))
+                                    Spacer(modifier = Modifier.width(14.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
                                             text = song.title,
-                                            color = if (isCurrent) Color(0xFFBB86FC) else Color.White,
-                                            fontWeight = if (isCurrent) FontWeight.Bold else FontWeight.Normal,
+                                            color = if (isCurrent) TextPrimary else TextSecondary,
+                                            fontWeight = if (isCurrent) FontWeight.SemiBold else FontWeight.Normal,
                                             maxLines = 1,
                                             overflow = TextOverflow.Ellipsis,
                                             fontSize = 15.sp
                                         )
+                                        Spacer(modifier = Modifier.height(2.dp))
                                         Text(
                                             text = "${song.artist} · ${song.folder}",
-                                            color = Color.Gray,
+                                            color = TextTertiary,
                                             fontSize = 12.sp,
                                             maxLines = 1
                                         )
@@ -571,8 +684,8 @@ fun MainScreen(
                                         Icon(
                                             imageVector = Icons.Default.Favorite,
                                             contentDescription = null,
-                                            tint = Color(0xFFE91E63),
-                                            modifier = Modifier.size(16.dp)
+                                            tint = AccentHeart,
+                                            modifier = Modifier.size(15.dp)
                                         )
                                     }
                                 }
